@@ -33,7 +33,22 @@ from diffusers.loaders.lora_base import (
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from remote_pdb import RemotePdb
-from torch.distributed.fsdp import MixedPrecisionPolicy
+
+# --- FSDP mixed-precision compatibility across Torch versions ---
+# torch >= 2.5:  torch.distributed.fsdp.MixedPrecisionPolicy
+# torch <= 2.4:  torch.distributed.fsdp.MixedPrecision
+# Če ni nobenega (CPU-only build brez FSDP), naredimo dummy tip,
+# da anotacije ostanejo veljavne.
+try:
+    from torch.distributed.fsdp import MixedPrecisionPolicy as _MPBase  # torch >= 2.5
+except Exception:
+    try:
+        from torch.distributed.fsdp import MixedPrecision as _MPBase  # torch <= 2.4
+    except Exception:
+        class _MPBase:  # pragma: no cover
+            pass
+MixedPrecisionPolicy = _MPBase
+# --- konec FSDP compat bloka ---
 
 import fastvideo.envs as envs
 from fastvideo.logger import init_logger
