@@ -8,8 +8,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import load_file
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.tensor import DTensor
-
+try:
+    from torch.distributed.tensor import DTensor  # torch >= 2.5
+except Exception:  # torch <= 2.4
+    from torch.distributed._tensor.api import DTensor
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs, TrainingArgs
 from fastvideo.layers.lora.linear import (BaseLayerWithLoRA, get_lora_layer,
