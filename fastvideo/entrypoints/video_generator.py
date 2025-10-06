@@ -5,7 +5,7 @@ VideoGenerator module for FastVideo.
 This module provides a consolidated interface for generating videos using
 diffusion models.
 """
-
+from stabilizer import temporal_cosine_drift, log_periodic_stabilizer
 import math
 import os
 import time
@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 class VideoGenerator:
     """
     A unified class for generating videos using diffusion models.
-    
+
     This class provides a simple interface for video generation with rich
     customization options, similar to popular frameworks like HF Diffusers.
     """
@@ -40,7 +40,7 @@ class VideoGenerator:
                  executor_class: type[Executor], log_stats: bool):
         """
         Initialize the video generator.
-        
+
         Args:
             fastvideo_args: The inference arguments
             executor_class: The executor class to use for inference
@@ -56,14 +56,14 @@ class VideoGenerator:
                         **kwargs) -> "VideoGenerator":
         """
         Create a video generator from a pretrained model.
-        
+
         Args:
             model_path: Path or identifier for the pretrained model
             device: Device to load the model on (e.g., "cuda", "cuda:0", "cpu")
             torch_dtype: Data type for model weights (e.g., torch.float16)
             pipeline_config: Pipeline config to use for inference
             **kwargs: Additional arguments to customize model loading, set any FastVideoArgs or PipelineConfig attributes here.
-                
+
         Returns:
             The created video generator
 
@@ -80,10 +80,10 @@ class VideoGenerator:
                             fastvideo_args: FastVideoArgs) -> "VideoGenerator":
         """
         Create a video generator with the specified arguments.
-        
+
         Args:
             fastvideo_args: The inference arguments
-                
+
         Returns:
             The created video generator
         """
@@ -105,7 +105,7 @@ class VideoGenerator:
     ) -> dict[str, Any] | list[np.ndarray] | list[dict[str, Any]]:
         """
         Generate a video based on the given prompt.
-        
+
         Args:
             prompt: The prompt to use for generation (optional if prompt_txt is provided)
             negative_prompt: The negative prompt to use (overrides the one in fastvideo_args)
@@ -122,7 +122,7 @@ class VideoGenerator:
             seed: Random seed for generation (overrides fastvideo_args)
             callback: Callback function called after each step
             callback_steps: Number of steps between each callback
-            
+
         Returns:
             Either the output dictionary, list of frames, or list of results for batch processing
         """
@@ -229,8 +229,7 @@ class VideoGenerator:
 
         # Adjust number of frames based on number of GPUs
         if use_temporal_scaling_frames:
-            orig_latent_num_frames = (num_frames -
-                                      1) // temporal_scale_factor + 1
+            orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
         else:  # stepvideo only
             orig_latent_num_frames = sampling_param.num_frames // 17 * 3
 
@@ -238,29 +237,24 @@ class VideoGenerator:
             # Adjust latent frames to be divisible by number of GPUs
             if sampling_param.num_frames_round_down:
                 # Ensure we have at least 1 batch per GPU
-                new_latent_num_frames = max(
-                    1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                new_latent_num_frames = max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
             else:
-                new_latent_num_frames = math.ceil(
-                    orig_latent_num_frames / num_gpus) * num_gpus
+                new_latent_num_frames = math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
 
             if use_temporal_scaling_frames:
                 # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                new_num_frames = (new_latent_num_frames -
-                                  1) * temporal_scale_factor + 1
+                new_num_frames = (new_latent_num_frames - 1) * temporal_scale_factor + 1
             else:  # stepvideo only
                 # Find the least common multiple of 3 and num_gpus
                 divisor = math.lcm(3, num_gpus)
                 # Round up to the nearest multiple of this LCM
-                new_latent_num_frames = (
-                    (new_latent_num_frames + divisor - 1) // divisor) * divisor
+                new_latent_num_frames = ((new_latent_num_frames + divisor - 1) // divisor) * divisor
                 # Convert back to actual frames using the StepVideo formula
                 new_num_frames = new_latent_num_frames // 3 * 17
 
             logger.info(
                 "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
-                sampling_param.num_frames, new_num_frames,
-                fastvideo_args.num_gpus)
+                sampling_param.num_frames, new_num_frames, fastvideo_args.num_gpus)
             sampling_param.num_frames = new_num_frames
 
         # Calculate sizes
@@ -289,7 +283,7 @@ class VideoGenerator:
      embedded_guidance_scale: {fastvideo_args.pipeline_config.embedded_cfg_scale}
                   save_video: {sampling_param.save_video}
                   output_path: {sampling_param.output_path}
-        """ # type: ignore[attr-defined]
+        """  # type: ignore[attr-defined]
         logger.info(debug_str)
 
         # Prepare batch
@@ -305,14 +299,50 @@ class VideoGenerator:
         if batch.output_video_name is None:
             batch.output_video_name = prompt[:100]
 
-        # Run inference
+        # ----------- RUN INFERENCE -----------
         start_time = time.perf_counter()
         output_batch = self.executor.execute_forward(batch, fastvideo_args)
         samples = output_batch.output
         logging_info = output_batch.logging_info
-
         gen_time = time.perf_counter() - start_time
         logger.info("Generated successfully in %.2f seconds", gen_time)
+        # ------------------------------------
+
+        # ---------- STABILIZER DIAGNOSTICS ----------
+        temporal_drift_val: float | None = None
+        stabilizer_penalty_val: float | None = None
+
+        # Flags (safe defaults if not present in args)
+        enable_log_stabilizer: bool = bool(getattr(fastvideo_args, "enable_log_stabilizer", 0))
+        stab_freq: float = float(getattr(fastvideo_args, "stab_freq", 5.5))
+        stab_weight: float = float(getattr(fastvideo_args, "stab_weight", 0.01))
+
+        latents = getattr(output_batch, "trajectory_latents", None)
+        if latents is not None:
+            if not torch.is_tensor(latents):
+                try:
+                    latents = torch.as_tensor(latents)
+                except Exception:
+                    latents = None
+
+        if latents is not None and latents.ndim in (2, 3):
+            try:
+                temporal_drift_val = float(temporal_cosine_drift(latents).mean().item())
+                logger.info("[Diag] temporal drift: %.4f", temporal_drift_val)
+
+                if enable_log_stabilizer:
+                    # No backprop here; just measure penalty for logging/telemetry.
+                    stabilizer_penalty = log_periodic_stabilizer(
+                        latents.float(), freq=stab_freq, weight=stab_weight
+                    )
+                    stabilizer_penalty_val = float(stabilizer_penalty.detach().cpu().item())
+                    logger.info("[Diag] stabilizer penalty (freq=%.3f, w=%.4f): %.6f",
+                                stab_freq, stab_weight, stabilizer_penalty_val)
+            except Exception as e:
+                logger.warning("Stabilizer diagnostics failed: %s", e)
+        else:
+            logger.info("No trajectory latents available; skipping drift diagnostics.")
+        # ---------------------------------------------
 
         # Process outputs
         videos = rearrange(samples, "b c t h w -> t b c h w")
@@ -327,8 +357,7 @@ class VideoGenerator:
             output_path = batch.output_path
             if output_path:
                 os.makedirs(output_path, exist_ok=True)
-                video_path = os.path.join(output_path,
-                                          f"{batch.output_video_name}.mp4")
+                video_path = os.path.join(output_path, f"{batch.output_video_name}.mp4")
                 imageio.mimsave(video_path, frames, fps=batch.fps, format="mp4")
                 logger.info("Saved video to %s", video_path)
             else:
@@ -344,9 +373,11 @@ class VideoGenerator:
                 "size": (target_height, target_width, batch.num_frames),
                 "generation_time": gen_time,
                 "logging_info": logging_info,
-                "trajectory": output_batch.trajectory_latents,
-                "trajectory_timesteps": output_batch.trajectory_timesteps,
-                "trajectory_decoded": output_batch.trajectory_decoded,
+                "trajectory": getattr(output_batch, "trajectory_latents", None),
+                "trajectory_timesteps": getattr(output_batch, "trajectory_timesteps", None),
+                "trajectory_decoded": getattr(output_batch, "trajectory_decoded", None),
+                "temporal_drift": temporal_drift_val,
+                "stabilizer_penalty": stabilizer_penalty_val,
             }
 
     def set_lora_adapter(self,
@@ -356,7 +387,7 @@ class VideoGenerator:
 
     def unmerge_lora_weights(self) -> None:
         """
-        Use unmerged weights for inference to produce videos that align with 
+        Use unmerged weights for inference to produce videos that align with
         validation videos generated during training.
         """
         self.executor.unmerge_lora_weights()
