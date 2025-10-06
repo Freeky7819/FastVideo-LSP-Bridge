@@ -13,8 +13,16 @@ import torch
 from torch import nn
 from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed._tensor import distribute_tensor
-from torch.distributed.fsdp import (CPUOffloadPolicy, FSDPModule,
-                                    MixedPrecisionPolicy, fully_shard)
+from .fsdp_imports import (
+    FSDPModule,
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    ShardingStrategy,
+    BackwardPrefetch,
+    StateDictType,
+    FullStateDictConfig,
+    LocalStateDictConfig,
+)
 from torch.nn.modules.module import _IncompatibleKeys
 
 from fastvideo.logger import init_logger
